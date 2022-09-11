@@ -1,0 +1,216 @@
+package route_calculation_worker
+
+import (
+	"github.com/gtforge/go-workers"
+	"github.com/gtforge/logging-go/logpot"
+	routeservice "github.com/gtforge/rex_ride_service/lib/external-services/route-service"
+	driverprogressmodels "github.com/gtforge/rex_ride_service/lib/fleet-ride-actions/flows/driver-progress/models"
+	driverprogressheartbeatstep "github.com/gtforge/rex_ride_service/lib/fleet-ride-actions/flows/driver-progress/steps/heartbeat"
+	rideinforedis "github.com/gtforge/rex_ride_service/lib/ride-info/ride-info-redis"
+	"github.com/gtforge/rex_ride_service/lib/utils"
+	gettEnv "github.com/gtforge/services_common_go/gett-env"
+	gettSettings "github.com/gtforge/services_common_go/gett-settings"
+	gettWorkers "github.com/gtforge/services_common_go/gett-workers"
+	"math"
+	"time"
+)
+
+const timeBetweenHeartBeats = 5
+
+var Instance = &routeFromSinglePointWorker{
+	step:  driverprogressheartbeatstep.Instance,
+	cache: rideinforedis.Instance,
+	route: routeservice.Instance,
+}
+
+type routeFromSinglePointWorker struct {
+	step  driverprogressmodels.Step
+	cache rideinforedis.Provider
+	route routeservice.Provider
+}
+
+func (w *routeFromSinglePointWorker) GetWorkerOptions() gettWorkers.WorkerOptions {
+	return gettWorkers.WorkerOptions{
+		Name:     "RouteFromSinglePointWorker:",
+		CronLine: "0/5 * * * * * *", //every 5 seconds
+	}
+}
+
+func (w *routeFromSinglePointWorker) Perform(msg *workers.Msg) {
+	logger := logpot.WithField("worker_start_time", time.Now().UTC())
+	logger.Info("starting RouteFromSinglePointWorker worker")
+	logger.Info("=== Job Started | identifier : 'rex_ride - calculate_route_from_single_point_worker' ===")
+
+	defer func() {
+		logger = logger.WithField("worker_end_time", time.Now().UTC())
+		logger.Info("finished RouteFromSinglePointWorker worker")
+		logger.Info("=== Job Ended | identifier : 'rex_ride - calculate_route_from_single_point_worker' ===")
+	}()
+
+	for _, env := range gettEnv.Envs {
+		if !gettSettings.EnvSetting(env.Code, "route", "smooth_route_before_pickup").AsBool() {
+			continue
+		}
+		orderListToBeTrimmed, err := w.cache.GetOrdersIDsListForSmoothingRoute(env.EnvCode())
+		if err != nil {
+			logger.WithError(err).Error("unable to get list of orderIDs from redis")
+		} else {
+			logger.WithFields(logpot.Fields{
+				"env":          env,
+				"orders_found": len(orderListToBeTrimmed),
+			}).Info("will start trimming for environment")
+			utils.NewRelicSetCustomMetric("LRC/OrdersToBeCalculatedRouteAmount", float64(len(orderListToBeTrimmed)))
+			for _, orderID := range orderListToBeTrimmed {
+				singleFlowInputWithScore, err := w.cache.GetDataForSmoothingRoute(env.EnvCode(), orderID)
+				if err != nil {
+					logger.WithError(err).Error("unable to get singleFlowInputAndRoute from redis")
+					continue
+				}
+				if flowInputAndRoute, ok := singleFlowInputWithScore.Member.(rideinforedis.FlowInputAndRoute); ok {
+
+					//calculate the distance needed to trim
+					distanceToTrim := CalculateDistanceToTrim(&flowInputAndRoute)
+					logger.WithFields(logpot.Fields{
+						"order":            flowInputAndRoute.FlowInput.OrderID,
+						"route":            flowInputAndRoute.Route,
+						"flowInput":        flowInputAndRoute.FlowInput,
+						"distance_to_trim": distanceToTrim,
+					}).Debug("worker will try to trim")
+					request := routeservice.GetRouteLocalCalcRequestByDistance{
+						Polyline: flowInputAndRoute.Route.Polyline,
+						Distance: distanceToTrim,
+					}
+					routeTrimmed, err := routeservice.GetTrimmedRouteBySpecificMeters(request)
+					if err != nil {
+						logger.WithError(err).Error("unable to trim route")
+						continue
+					}
+					if routeTrimmed.Found {
+						flowInputAndRoute.Route.Polyline = routeTrimmed.Polyline
+						flowInputAndRoute.FlowInput.DriverProgressRequest.Route = routeTrimmed.Polyline
+						flowInputAndRoute.FlowInput.DriverProgressRequest.DriverLocation.Lat = routeTrimmed.DriverPoint.Lat
+						flowInputAndRoute.FlowInput.DriverProgressRequest.DriverLocation.Lng = routeTrimmed.DriverPoint.Lng
+						flowInputAndRoute.FlowInput.DriverProgressRequest.ETA.Add(-time.Second * timeBetweenHeartBeats)
+						if routeTrimmed.Bearing != 0 {
+							flowInputAndRoute.FlowInput.DriverProgressRequest.Bearing = routeTrimmed.Bearing
+						}
+					} else {
+						continue
+					}
+					logger.WithFields(logpot.Fields{
+						"newRoute":          flowInputAndRoute.Route,
+						"newFlowInput":      flowInputAndRoute.FlowInput,
+						"newDriverLocation": flowInputAndRoute.FlowInput.DriverProgressRequest.DriverLocation,
+					}).Debug("finished trimming")
+
+					_, _, err = w.step.Do(flowInputAndRoute.FlowInput)
+					if err != nil {
+						logger.WithError(err).Error("unable to send heartbeat ")
+
+					}
+
+					if flowInputAndRoute.Route.Meters <= 0 {
+						//remove the orderID from cache
+
+						err = w.cache.RemoveOrderIDForSmoothingRoute(env.EnvCode(), orderID)
+						if err != nil {
+							logger.WithError(err).Error("unable to remove order id from redis ")
+
+						}
+						err = w.cache.RemoveAllDataFromCacheForSmoothingRoute(env.EnvCode(), orderID)
+						if err != nil {
+							logger.WithError(err).Error("unable to remove flowIputAndRoute from redis ")
+
+						}
+					} else {
+						//save in cache with new trimmed route and trimmed leg
+						//add to the set one millisecond
+						//after set we will need to remove all that are lower scores(check how to flip the scores as the high are the samller numbers)
+
+						err = w.cache.SetDataForSmoothingRoute(flowInputAndRoute, singleFlowInputWithScore.Score+1)
+						if err != nil {
+							logger.WithError(err).Error("unable to set SingleFlowInputAndRouteWithGivenScore on redis")
+
+						}
+						err = w.cache.RemoveOldDataFromCacheForSmoothingRoute(env.EnvCode(), orderID, singleFlowInputWithScore.Score)
+						if err != nil {
+							logger.WithError(err).Error("unable to delete old scores from redis")
+
+						}
+
+					}
+
+				}
+
+			}
+		}
+	}
+}
+func CalculateDistanceToTrim(flowInputAndRoute *rideinforedis.FlowInputAndRoute) (calculatedDistanceToTrim float64) {
+	logger := logpot.WithField("steps", flowInputAndRoute.Route.Steps)
+	logger.Debug("starting calculating distance to trim")
+
+	for i := 0; i < len(flowInputAndRoute.Route.Steps); i++ {
+		singleStep := flowInputAndRoute.Route.Steps[i]
+		if singleStep.Duration.Seconds() <= 0 {
+			flowInputAndRoute.Route.Steps = append(flowInputAndRoute.Route.Steps[:i], flowInputAndRoute.Route.Steps[i+1:]...)
+		} else if singleStep.Duration.Seconds() <= timeBetweenHeartBeats {
+			flowInputAndRoute.Route.Seconds -= flowInputAndRoute.Route.Steps[0].Duration.Seconds()
+			if i < len(flowInputAndRoute.Route.Steps)-1 {
+				flowInputAndRoute.Route.Steps[i+1].Distance.Meters += singleStep.Meters
+			}
+			flowInputAndRoute.Route.Steps = append(flowInputAndRoute.Route.Steps[:0], flowInputAndRoute.Route.Steps[1:]...)
+			break
+		} else {
+			break
+		}
+
+	}
+
+	for i := 0; i < len(flowInputAndRoute.Route.Steps); i++ {
+		singleStep := flowInputAndRoute.Route.Steps[i]
+		distanceToTrim := int(math.Round(float64(singleStep.Meters) / singleStep.Duration.Seconds() * timeBetweenHeartBeats))
+		if distanceToTrim <= 0 {
+			if i < len(flowInputAndRoute.Route.Steps)-1 {
+				flowInputAndRoute.Route.Steps[i+1].Distance.Meters += singleStep.Meters
+				flowInputAndRoute.Route.Steps[i+1].Duration += singleStep.Duration
+			}
+			flowInputAndRoute.Route.Steps = append(flowInputAndRoute.Route.Steps[:i], flowInputAndRoute.Route.Steps[i+1:]...)
+		} else {
+			break
+		}
+	}
+	if len(flowInputAndRoute.Route.Steps) > 0 {
+		currentStep := flowInputAndRoute.Route.Steps[0]
+
+		logger.WithField("step", currentStep).Debug("currently in step")
+
+		distanceToTrim := int(math.Round(float64(currentStep.Meters) / currentStep.Duration.Seconds() * timeBetweenHeartBeats))
+		logger.WithField("distanceCalculated", distanceToTrim).Debug("new distance to trim")
+		logger.WithField("step distance", currentStep.Distance.Meters).Debug("the step remaining distance")
+
+		if currentStep.Meters < distanceToTrim {
+			distanceToTrim = currentStep.Meters
+		}
+		currentStep.Distance.Meters -= distanceToTrim
+
+		currentStep.Duration -= time.Second * timeBetweenHeartBeats
+		if currentStep.Duration < 0 {
+			currentStep.Duration = 0
+		}
+		flowInputAndRoute.Route.Seconds -= timeBetweenHeartBeats
+
+		flowInputAndRoute.Route.Meters -= distanceToTrim
+		if (len(flowInputAndRoute.Route.Steps) == 1 && (currentStep.Duration.Seconds() == 0 || flowInputAndRoute.Route.Meters < currentStep.Distance.Meters)) || flowInputAndRoute.Route.Meters == 0 {
+			distanceToTrim = flowInputAndRoute.Route.Meters + 200 + currentStep.Distance.Meters
+		}
+		return float64(distanceToTrim)
+	}
+	if flowInputAndRoute.Route.Meters > 0 {
+		tempMeters := flowInputAndRoute.Route.Meters
+		flowInputAndRoute.Route.Meters = 0
+		return float64(tempMeters) + 10
+	}
+
+	return 200
+}
