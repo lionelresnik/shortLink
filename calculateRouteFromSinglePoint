@@ -1,18 +1,7 @@
 package route_calculation_worker
 
 import (
-	"github.com/gtforge/go-workers"
-	"github.com/gtforge/logging-go/logpot"
-	routeservice "github.com/gtforge/rex_ride_service/lib/external-services/route-service"
-	driverprogressmodels "github.com/gtforge/rex_ride_service/lib/fleet-ride-actions/flows/driver-progress/models"
-	driverprogressheartbeatstep "github.com/gtforge/rex_ride_service/lib/fleet-ride-actions/flows/driver-progress/steps/heartbeat"
-	rideinforedis "github.com/gtforge/rex_ride_service/lib/ride-info/ride-info-redis"
-	"github.com/gtforge/rex_ride_service/lib/utils"
-	gettEnv "github.com/gtforge/services_common_go/gett-env"
-	gettSettings "github.com/gtforge/services_common_go/gett-settings"
-	gettWorkers "github.com/gtforge/services_common_go/gett-workers"
-	"math"
-	"time"
+	
 )
 
 const timeBetweenHeartBeats = 5
