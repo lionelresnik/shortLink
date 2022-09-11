@@ -1,0 +1,253 @@
+package cmd
+
+import (
+	"math"
+	googlemaps "googlemaps.github.io/maps"
+	logrus "github.com/sirupsen/logrus"
+)
+
+const (
+	// According to Wikipedia, the Earth's radius is about 6,378100m
+	earthRadius                    = 6378100
+	defaultDistanceInBetweenPoints = 20
+	driverIsCloseEnough            = 15
+)
+
+// will receive a polyline of type string and a point of type lat and long, from wich will find if the point is "inside the route"
+//if so will trim the route beginning from the given point till the end of the route, if not will return false and empty string
+func GetNewDriverRoute(routeRequest GetRouteLocalCalcRequest) (GetRouteLocalCalcResponse, error) {
+	logger := logrus.WithFields(logpot.Fields{"polyline": routeRequest.Polyline, "driverPoint": routeRequest.DriverPoint.String()})
+
+	routeResponse := GetRouteLocalCalcResponse{}
+
+	if routeRequest.Polyline == "" {
+		return routeResponse, errpot.New("illegal polyline received").WithFields(logger.GetFields())
+	}
+
+	if math.Abs(routeRequest.DriverPoint.Lng) > 180 || math.Abs(routeRequest.DriverPoint.Lat) > 90 {
+		return routeResponse, errpot.New("illegal driverPoint received").WithFields(logger.GetFields())
+	}
+
+	logger.Debug("polyline and driver point received")
+
+	latlng, err := googlemaps.DecodePolyline(routeRequest.Polyline)
+	if err != nil {
+		return routeResponse, errpot.Wrap(err, "unable to decode polyline to points").WithFields(logger.GetFields())
+	}
+
+	if len(latlng) == 0 {
+		return routeResponse, errpot.New("no points found- unable to decode polyline to points").WithFields(logger.GetFields())
+	}
+	var tempLtLng []googlemaps.LatLng
+	tempLtLng = append(tempLtLng, latlng[0])
+	for i := 1; i < len(latlng); i++ {
+
+		distanceBetweenTwoPoints := Distance(latlng[i-1], latlng[i])
+		//logger.WithField("distanceBetweenTwoPoints", distanceBetweenTwoPoints).Debug("the distance between two points in a road")
+		pointsToAddToLine := int(distanceBetweenTwoPoints / defaultDistanceInBetweenPoints)
+		bearing := getBearing(latlng[i-1], latlng[i])
+
+		for j := 0; j <= pointsToAddToLine; j++ {
+			if Distance(tempLtLng[len(tempLtLng)-1], routeRequest.DriverPoint) <= driverIsCloseEnough {
+				if len(tempLtLng) == 1 {
+					startingPoint, _ := findStartingPoint(tempLtLng[len(tempLtLng)-1], latlng[len(latlng)-1], routeRequest.DriverPoint)
+					tempLtLng = append([]googlemaps.LatLng{startingPoint}, latlng[i:]...)
+				} else {
+					startingPoint1, interval1 := findStartingPoint(tempLtLng[len(tempLtLng)-1], tempLtLng[len(tempLtLng)-2], routeRequest.DriverPoint)
+					startingPoint2, interval2 := findStartingPoint(tempLtLng[len(tempLtLng)-1], latlng[i], routeRequest.DriverPoint)
+					if interval1 <= interval2 {
+						tempLtLng = append([]googlemaps.LatLng{startingPoint1}, latlng[i:]...)
+					} else {
+						tempLtLng = append([]googlemaps.LatLng{startingPoint2}, latlng[i:]...)
+					}
+				}
+
+				routeResponse.Polyline = convertToPolyline(tempLtLng)
+				routeResponse.Found = true
+				return routeResponse, nil
+			}
+			tempLtLng = append(tempLtLng, CreatePointFromDistance(tempLtLng[len(tempLtLng)-1], defaultDistanceInBetweenPoints, bearing))
+		}
+
+		tempLtLng = append(tempLtLng, latlng[i])
+
+	}
+
+	lastPointIndex := len(tempLtLng) - 1
+	if Distance(tempLtLng[lastPointIndex], routeRequest.DriverPoint) <= driverIsCloseEnough && lastPointIndex > 0 {
+		startingPoint, _ := findStartingPoint(tempLtLng[lastPointIndex], tempLtLng[len(tempLtLng)-2], routeRequest.DriverPoint)
+		tempLtLng = append([]googlemaps.LatLng{startingPoint}, latlng[len(latlng)-1])
+		routeResponse.Polyline = convertToPolyline(tempLtLng)
+		routeResponse.Found = true
+		return routeResponse, nil
+	}
+
+	return routeResponse, nil
+}
+
+//convert back an array of lat lng points to polyline of type string
+func convertToPolyline(ltlngPoints []googlemaps.LatLng) string {
+
+	backToPolyline := googlemaps.Encode(ltlngPoints)
+	logger := logrus.WithField("polyline", backToPolyline)
+	if backToPolyline == "" {
+		logger.Warn("Couldn't convert back to polyline")
+	}
+	logger.Debug("encoded back to polyline")
+
+	return backToPolyline
+}
+
+// Distance returns a distance populated with the lat and lng coordinates
+//will calculate the distance in meters from one point to another
+func Distance(p1, p2 googlemaps.LatLng) float64 {
+	// convert to radians
+	// must cast radius as float to multiply later
+	var la1, lo1, la2, lo2 float64
+	la1 = float64(p1.Lat) * math.Pi / 180
+	lo1 = float64(p1.Lng) * math.Pi / 180
+	la2 = float64(p2.Lat) * math.Pi / 180
+	lo2 = float64(p2.Lng) * math.Pi / 180
+
+	// calculate
+	h := hsin(la2-la1) + math.Cos(la1)*math.Cos(la2)*hsin(lo2-lo1)
+
+	return 2 * earthRadius * math.Asin(math.Sqrt(h))
+}
+
+// CreatePointFromDistance returns a Point populated with the lat and lng coordinates
+// by transposing the origin point the passed in distance (in Meters)
+// by the passed in compass bearing (in degrees).
+func CreatePointFromDistance(point googlemaps.LatLng, dist float64, bearing float64) googlemaps.LatLng {
+
+	dr := dist / earthRadius
+
+	bearing = bearing * (math.Pi / 180.0)
+
+	lat1 := point.Lat * (math.Pi / 180.0)
+	lng1 := point.Lng * (math.Pi / 180.0)
+
+	lat2_part1 := math.Sin(lat1) * math.Cos(dr)
+	lat2_part2 := math.Cos(lat1) * math.Sin(dr) * math.Cos(bearing)
+
+	lat2 := math.Asin(lat2_part1 + lat2_part2)
+
+	lng2_part1 := math.Sin(bearing) * math.Sin(dr) * math.Cos(lat1)
+	lng2_part2 := math.Cos(dr) - (math.Sin(lat1) * math.Sin(lat2))
+
+	lng2 := lng1 + math.Atan2(lng2_part1, lng2_part2)
+	lng2 = math.Mod(lng2+3*math.Pi, 2*math.Pi) - math.Pi
+
+	lat2 = lat2 * (180.0 / math.Pi)
+	lng2 = lng2 * (180.0 / math.Pi)
+
+	return googlemaps.LatLng{Lat: lat2, Lng: lng2}
+}
+func hsin(theta float64) float64 {
+	return math.Pow(math.Sin(theta/2), 2)
+}
+
+//getBearing: Calculates the initial bearing (sometimes referred to as forward azimuth)
+func getBearing(from, to googlemaps.LatLng) float64 {
+
+	dLon := (to.Lng - from.Lng) * math.Pi / 180.0
+
+	lat1 := from.Lat * math.Pi / 180.0
+	lat2 := to.Lat * math.Pi / 180.0
+
+	y := math.Sin(dLon) * math.Cos(lat2)
+	x := math.Cos(lat1)*math.Sin(lat2) -
+		math.Sin(lat1)*math.Cos(lat2)*math.Cos(dLon)
+	brng := math.Atan2(y, x) * 180.0 / math.Pi
+
+	return brng
+}
+
+//find starting point of the driver
+func findStartingPoint(point1, point2, driverPoint googlemaps.LatLng) (googlemaps.LatLng, float64) {
+	b := googlemaps.LatLng{
+		Lat: point1.Lat - point2.Lat,
+		Lng: point1.Lng - point2.Lng,
+	}
+	a := googlemaps.LatLng{
+		Lat: driverPoint.Lat - point2.Lat,
+		Lng: driverPoint.Lng - point2.Lng,
+	}
+
+	scalar := (a.Lat*b.Lat + a.Lng*b.Lng) / (b.Lat*b.Lat + b.Lng*b.Lng)
+	r := googlemaps.LatLng{
+		Lat: scalar * b.Lat,
+		Lng: scalar * b.Lng,
+	}
+
+	startingPoint := googlemaps.LatLng{
+		Lat: r.Lat + point2.Lat,
+		Lng: r.Lng + point2.Lng,
+	}
+	interval := math.Sqrt(math.Abs((a.Lat*a.Lat + a.Lng*a.Lng) - scalar*scalar))
+
+	return startingPoint, interval
+
+}
+
+// will receive a polyline of type string and a distance, from wich will find if the point is "inside the route"
+//if so will fina a point inside the route at the distance specified and trim the route beginning from it till the end of the route, if not will return false and empty string
+func GetTrimmedRouteBySpecificMeters(routeRequest GetRouteLocalCalcRequestByDistance) (GetRouteLocalCalcResponse, error) {
+	logger := logrus.WithFields(logpot.Fields{"polyline": routeRequest.Polyline, "distance": routeRequest.Distance})
+
+	routeResponse := GetRouteLocalCalcResponse{}
+
+	if routeRequest.Polyline == "" {
+		return routeResponse, errpot.New("illegal polyline received").WithFields(logger.GetFields())
+	}
+
+	if routeRequest.Distance <= 0 {
+		return routeResponse, errpot.New("illegal distance received").WithFields(logger.GetFields())
+	}
+
+	logger.Debug("polyline and distance received")
+
+	latLngList, err := googlemaps.DecodePolyline(routeRequest.Polyline)
+	if err != nil {
+		return routeResponse, errpot.Wrap(err, "unable to decode polyline to points").WithFields(logger.GetFields())
+	}
+
+	if len(latLngList) == 0 {
+		return routeResponse, errpot.New("no points found- unable to decode polyline to points").WithFields(logger.GetFields())
+	}
+
+	var tempLtLng []googlemaps.LatLng
+	var bearing float64
+	var totalDistanceBetweenPoints float64
+	for i := 1; i < len(latLngList); i++ {
+
+		totalDistanceBetweenPoints += Distance(latLngList[i-1], latLngList[i])
+		bearing = getBearing(latLngList[i-1], latLngList[i])
+
+		if totalDistanceBetweenPoints <= routeRequest.Distance {
+			continue
+		} else {
+			tempLtLng = append(tempLtLng, CreatePointFromDistance(latLngList[i-1], Distance(latLngList[i-1], latLngList[i])-(totalDistanceBetweenPoints-routeRequest.Distance), bearing))
+			tempLtLng = append(tempLtLng, latLngList[i:]...)
+			routeResponse.Bearing = float32(bearing)
+			routeResponse.DriverPoint = tempLtLng[0]
+			routeResponse.Polyline = convertToPolyline(tempLtLng)
+			routeResponse.Found = true
+			logger.WithField("new polyline", routeResponse.Polyline).Debug("new route created")
+
+			return routeResponse, nil
+		}
+
+	}
+
+	logger.WithField("new polyline", routeResponse.Polyline).Debug("route is only last point")
+	tempLtLng = append(tempLtLng, latLngList[len(latLngList)-1])
+	routeResponse.Bearing = float32(bearing)
+	routeResponse.DriverPoint = tempLtLng[0]
+	routeResponse.Polyline = convertToPolyline(tempLtLng)
+	routeResponse.Found = true
+	return routeResponse, nil
+
+}
+
+
